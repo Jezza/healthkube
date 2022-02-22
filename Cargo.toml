@@ -16,4 +16,4 @@ thiserror = "1.0"
 
 clap = { version = "3.0", features = ["derive", "env"] }
 tokio = { version = "1.15.0", default-features = false, features = ["rt", "macros"] }
-reqwest = { version = "0.11.8", features = ["json"] }
+#reqwest = { version = "0.11.8", features = ["json"] }

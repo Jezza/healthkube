@@ -41,7 +41,7 @@ struct Args {
 }
 
 #[derive(ClapArgs, Debug)]
-#[clap(help_heading = "HEALTHCHECKS")]
+#[clap(next_help_heading = "HEALTHCHECKS")]
 struct HealthChecksInfo {
 	/// The read/write healthchecks' api key.
 	#[clap(long = "hc-key", env = "HC_API_KEY")]
@@ -108,16 +108,16 @@ async fn main() -> Result<()> {
 	};
 
 	let integrations = {
-		let mut integrations = hc.integrations;
-
-		if hc.all_integrations {
-			let all = hc_client
+		let mut integrations = if hc.all_integrations {
+			hc_client
 				.get_channels()?
 				.into_iter()
-				.map(|channel| channel.id);
+				.map(|channel| channel.id)
+				.collect()
+		} else {
+			hc.integrations
+		};
 
-			integrations.extend(all);
-		}
 		integrations.sort_unstable();
 		integrations.dedup();
 
@@ -162,9 +162,7 @@ async fn main() -> Result<()> {
 			println!("\tNamespace: {}", namespace);
 
 			let kube_client = Client::try_from(config.clone()).unwrap();
-
 			let kube_api: kube::Api<CronJob> = kube::Api::namespaced(kube_client, namespace);
-
 			let jobs = kube_api.list(&ListParams::default()).await?.items;
 
 			let common_tags = extract_tags(&jobs, rank).await;
@@ -202,16 +200,15 @@ async fn main() -> Result<()> {
 				Some(id)
 			};
 
-			let checks: Vec<String> = jobs.iter().filter_map(|job| register_job(job)).collect();
-
-			let Some(env_key) = env_key.as_deref() else {
-				continue;
-			};
-
-			let updated: Vec<_> = jobs
-				.into_iter()
-				.zip(checks.into_iter())
+			let updated: Vec<_> = jobs.into_iter()
+				.filter_map(|job| {
+					let id = register_job(&job)?;
+					Some((job, id))
+				})
 				.filter_map(|(mut job, check_id)| {
+					// @TODO Jezza - 22 Feb. 2022: I don't like checking this here...
+					//  but annoyingly, I need to side effects of register_job...
+					let env_key = env_key.as_deref()?;
 					let spec = job.spec.as_mut()?;
 					let spec = spec.job_template.spec.as_mut()?;
 					let spec = spec.template.spec.as_mut()?;
