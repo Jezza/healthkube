@@ -1,5 +1,6 @@
 #![feature(let_else)]
 #![feature(iter_intersperse)]
+#![feature(vec_retain_mut)]
 
 use std::collections::HashMap;
 
@@ -7,6 +8,7 @@ use anyhow::{Context as _, Result};
 use clap::{Args as ClapArgs, Parser};
 use healthchecks::model::NewCheck;
 use k8s_openapi::api::batch::v1::CronJob;
+use k8s_openapi::api::core::v1::Container;
 use k8s_openapi::api::core::v1::EnvVar;
 use kube::{Client, Config, ResourceExt};
 use kube::api::{ListParams, PostParams};
@@ -24,7 +26,7 @@ struct Args {
 	dry_run: bool,
 
 	/// The frequency at which a segment will be considered common enough to be used as a tag.
-	#[clap(long, default_value_t = 2)]
+	#[clap(long, default_value_t = 3)]
 	rank: u8,
 
 	/// The corresponding kubernetes jobs will be updated with an environment variable that uses
@@ -128,7 +130,6 @@ async fn main() -> Result<()> {
 		Some(integrations)
 	};
 
-
 	if !dry_run && hc.clear_existing_checks {
 		hc_client
 			.get_checks()?
@@ -158,89 +159,142 @@ async fn main() -> Result<()> {
 			.await
 			.unwrap();
 
+		let default_check = NewCheck {
+			timeout,
+			grace,
+			tz: timezone.clone(),
+			channels: integrations.clone(),
+			..Default::default()
+		};
+
 		for namespace in namespaces.split(',') {
 			println!("\tNamespace: {}", namespace);
 
 			let kube_client = Client::try_from(config.clone()).unwrap();
 			let kube_api: kube::Api<CronJob> = kube::Api::namespaced(kube_client, namespace);
-			let jobs = kube_api.list(&ListParams::default()).await?.items;
+			let mut jobs = kube_api.list(&ListParams::default()).await?.items;
 
-			let common_tags = extract_tags(&jobs, rank).await;
+			jobs.retain(|job| {
+				if let Some(name) = &job.metadata.name {
+					name == "sales-au-job-cleanup-shared-products-job"
+				} else {
+					false
+				}
+			});
 
-			let register_job = |job: &CronJob| {
-				let name = job.metadata.name.as_deref()?;
-				let schedule = job.spec.as_ref().map(|d| &*d.schedule)?;
+			let definitions: Vec<_> = jobs.iter_mut()
+				.filter_map(describe)
+				.collect();
 
-				let tags: String = name
-					.split('-')
-					.filter(|segment| common_tags.contains_key(*segment))
-					.intersperse(" ")
-					.collect();
+			let common_tags = {
+				let mut common_tags: HashMap<&str, u8> = definitions.iter()
+					.flat_map(|(name, _, _)| name.split('-'))
+					.fold(HashMap::new(), |mut acc, item| {
+						*acc.entry(item).or_default() += 1;
+						acc
+					});
 
-				if dry_run {
-					println!("\t\t: {: <50} -> [{}]", name, &tags);
-					return None;
+				common_tags.remove("job");
+				if rank > 0 {
+					common_tags.retain(|_, v| *v >= rank);
 				}
 
-				let new_check = NewCheck {
-					name: Some(name.into()),
-					schedule: Some(schedule.into()),
-					tags: Some(tags),
-					timeout,
-					grace,
-					tz: timezone.clone(),
-					channels: integrations.clone(),
-					unique: Some(vec![String::from("name")]),
-					..Default::default()
-				};
-
-				let (_, check) = hc_client.upsert_check(new_check).ok()?;
-				let id = check.id()?;
-				println!("\t\t: {: <50} -> {}", name, id);
-				Some(id)
+				common_tags
 			};
 
-			let updated: Vec<_> = jobs.into_iter()
-				.filter_map(|job| {
-					let id = register_job(&job)?;
-					Some((job, id))
-				})
-				.filter_map(|(mut job, check_id)| {
-					// @TODO Jezza - 22 Feb. 2022: I don't like checking this here...
-					//  but annoyingly, I need to side effects of register_job...
-					let env_key = env_key.as_deref()?;
-					let spec = job.spec.as_mut()?;
-					let spec = spec.job_template.spec.as_mut()?;
-					let spec = spec.template.spec.as_mut()?;
+			definitions.into_iter()
+				.filter_map(|(name, schedule, containers)| {
+					let tags: String = name
+						.split('-')
+						.filter(|segment| common_tags.contains_key(*segment))
+						.intersperse(" ")
+						.collect();
 
-					for container in spec.containers.iter_mut() {
-						let Some(env) = &mut container.env else {
-							continue;
-						};
-
-						let index = env.iter().position(|env| env.name == env_key);
-
-						let var = EnvVar {
-							name: env_key.into(),
-							value: Some(check_id.clone()),
-							..EnvVar::default()
-						};
-
-						match index {
-							Some(index) => env[index] = var,
-							None => env.push(var),
-						};
+					if dry_run {
+						println!("\t\t: {: <50} -> [{}]", name, &tags);
+						return None;
 					}
 
-					Some(job)
+					let (status, check_id) = {
+						let new_check = NewCheck {
+							name: Some(name.into()),
+							schedule: Some(schedule.into()),
+							tags: Some(tags),
+							unique: Some(vec![String::from("name")]),
+							..default_check.clone()
+						};
+
+						let (status, check) = hc_client.upsert_check(new_check).ok()?;
+						let check_id = check.id()?;
+
+						let status = match status {
+							healthchecks::manage::UpsertResult::Created => "Created",
+							healthchecks::manage::UpsertResult::Updated => "Updated",
+						};
+
+						(status, check_id)
+					};
+
+					println!("\t\t: {: <50} -> {}(\"{}\")", name, status, check_id);
+
+					let env_key = match env_key.as_deref() {
+						Some(value) => value,
+						None => {
+							// Skip updating kubernetes, if no env_key was defined.
+							containers.clear();
+							return None;
+						}
+					};
+
+					containers.retain_mut(|container| {
+						let Some(env) = &mut container.env else {
+							return false;
+						};
+
+						let item = env.iter_mut()
+							.find(|env| env.name == env_key)
+							.and_then(|var| var.value.as_mut());
+
+						match item {
+							Some(item) => {
+								let need_to_update = *item != check_id;
+								if need_to_update {
+									*item = check_id.clone();
+								}
+								need_to_update
+							}
+							None => {
+								let var = EnvVar {
+									name: env_key.into(),
+									value: Some(check_id.clone()),
+									..Default::default()
+								};
+								env.push(var);
+								true
+							}
+						}
+					});
+
+					if containers.is_empty() {
+						return None;
+					}
+
+					Some(1)
 				})
-				.collect();
+				.count();
 
 			if dry_run {
 				continue;
 			}
 
-			for job in updated {
+			for mut job in jobs {
+				let Some((_, _, containers)) = describe(&mut job) else {
+					continue;
+				};
+				if containers.is_empty() {
+					continue;
+				}
+
 				let params = PostParams::default();
 				let _ = kube_api.replace(&job.name(), &params, &job).await?;
 			}
@@ -250,18 +304,20 @@ async fn main() -> Result<()> {
 	Ok(())
 }
 
-async fn extract_tags(jobs: &[CronJob], rank: u8) -> HashMap<&str, u8> {
-	let mut common_tags: HashMap<&str, u8> = jobs
-		.iter()
-		.filter_map(|job| job.metadata.name.as_deref())
-		.flat_map(|job| job.split('-'))
-		.fold(HashMap::new(), |mut acc, item| {
-			*acc.entry(item).or_default() += 1;
-			acc
-		});
+fn describe(job: &mut CronJob) -> Option<(&str, &str, &mut Vec<Container>)> {
+	let CronJob {
+		spec,
+		metadata,
+		..
+	} = job;
 
-	common_tags.remove(&"job");
-	common_tags.retain(|_, v| *v > rank);
+	let name = metadata.name.as_deref()?;
 
-	common_tags
+	let spec = spec.as_mut()?;
+	let schedule = &*spec.schedule;
+	let spec = spec.job_template.spec.as_mut()?;
+	let spec = spec.template.spec.as_mut()?;
+	let containers = &mut spec.containers;
+
+	Some((name, schedule, containers))
 }

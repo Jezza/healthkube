@@ -389,15 +389,13 @@ dependencies = [
 
 [[package]]
 name = "healthkube"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",
  "healthchecks",
  "k8s-openapi",
  "kube",
- "serde",
- "serde_json",
  "thiserror",
  "tokio",
 ]
